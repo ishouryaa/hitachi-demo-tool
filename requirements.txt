@@ -1,0 +1,7 @@
+azure-functions
+azure-storage-blob
+requests
+python-dotenv
+google-genai
+opencv-python-headless
+fpdf2

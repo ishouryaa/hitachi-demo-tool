@@ -1,0 +1,14 @@
+.venv
+.git
+.vscode
+.env
+local.settings.json
+recording.mp4
+transcript.vtt
+demo_guide.pdf
+code_explainer.pdf
+screenshots
+.key_moments_cache
+.step_writer_cache
+__pycache__
+test

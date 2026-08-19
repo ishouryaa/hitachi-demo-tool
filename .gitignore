@@ -1,0 +1,22 @@
+# Secrets / local config
+.env
+local.settings.json
+
+# Media / generated demo assets
+recording.mp4
+transcript.vtt
+screenshots/
+full_code_explainer.pdf
+
+# Python
+__pycache__/
+*.pyc
+.python_packages/
+
+# Caches
+.key_moments_cache/
+.step_writer_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
