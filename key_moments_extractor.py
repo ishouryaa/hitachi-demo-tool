@@ -28,7 +28,7 @@ _last_call_time = 0
 
 def generate_with_rate_limit(client, max_attempts: int = 5, **kwargs):
     """Wraps client.models.generate_content with proactive spacing and
-    429 (RESOURCE_EXHAUSTED) retry/backoff.
+    retry/backoff for 429 (RESOURCE_EXHAUSTED) and 503 (UNAVAILABLE).
     """
     global _last_call_time
 
@@ -44,12 +44,14 @@ def generate_with_rate_limit(client, max_attempts: int = 5, **kwargs):
         except Exception as e:
             _last_call_time = time.time()
             msg = str(e)
-            if "RESOURCE_EXHAUSTED" not in msg and "429" not in msg:
+            is_rate_limit = "RESOURCE_EXHAUSTED" in msg or "429" in msg
+            is_overloaded = "UNAVAILABLE" in msg or "503" in msg
+            if not is_rate_limit and not is_overloaded:
                 raise
             # A per-day quota won't reset in seconds no matter how many times
             # we retry - fail fast instead of burning minutes (and risking
             # the whole function timing out) on retries that can't succeed.
-            if "PerDay" in msg:
+            if is_rate_limit and "PerDay" in msg:
                 raise RuntimeError(
                     "Gemini free-tier DAILY quota exhausted for this API key/project. "
                     "This will not resolve by retrying - wait for the daily reset or "
@@ -57,9 +59,15 @@ def generate_with_rate_limit(client, max_attempts: int = 5, **kwargs):
                 ) from e
             if attempt == max_attempts:
                 raise
-            delay_match = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+)", msg)
-            delay = int(delay_match.group(1)) + 3 if delay_match else 15 * attempt
-            print(f"  Gemini rate limit hit, retrying in {delay}s (attempt {attempt}/{max_attempts})...")
+            if is_rate_limit:
+                delay_match = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+)", msg)
+                delay = int(delay_match.group(1)) + 3 if delay_match else 15 * attempt
+                print(f"  Gemini rate limit hit, retrying in {delay}s (attempt {attempt}/{max_attempts})...")
+            else:
+                # Google's own 503 message calls this "usually temporary" -
+                # back off and retry rather than failing the whole job.
+                delay = 10 * attempt
+                print(f"  Gemini overloaded (503), retrying in {delay}s (attempt {attempt}/{max_attempts})...")
             time.sleep(delay)
 
 PROMPT_TEMPLATE = """You are reviewing the transcript of a product demo call between a

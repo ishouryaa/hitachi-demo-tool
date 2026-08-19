@@ -10,6 +10,22 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 class GraphConfigError(RuntimeError):
     """Raised when required environment variables are missing."""
 
+
+def _raise_for_status_with_body(resp: requests.Response) -> None:
+    """Like resp.raise_for_status(), but includes Graph's error body (error
+    code + message) in the exception instead of just the status line - a
+    bare 403/404 status gives no way to tell an unconsented permission apart
+    from a licensing/policy restriction apart from a bad meeting ID.
+    """
+    if resp.ok:
+        return
+    detail = resp.text[:1000] if resp.text else "(no response body)"
+    raise requests.HTTPError(
+        f"{resp.status_code} {resp.reason} for url: {resp.url}\nGraph response: {detail}",
+        response=resp,
+    )
+
+
 class GraphClient:
     def __init__(self):
         self.tenant_id = os.environ.get("GRAPHTENANTID")
@@ -63,7 +79,7 @@ class GraphClient:
             return self._object_id_cache[email_or_upn]
         url = f"{GRAPH_BASE}/users/{email_or_upn}"
         resp = requests.get(url, headers=self.headers)
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         object_id = resp.json()["id"]
         self._object_id_cache[email_or_upn] = object_id
         return object_id
@@ -79,7 +95,7 @@ class GraphClient:
             "grant_type": "client_credentials",
         }
         resp = requests.post(url, data=body)
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()["access_token"]
 
     @property
@@ -104,7 +120,7 @@ class GraphClient:
             f"?$filter=JoinWebUrl eq '{escaped}'"
         )
         resp = requests.get(url, headers=self.headers)
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         results = resp.json().get("value", [])
         if not results:
             raise ValueError(f"No meeting found for join URL: {join_url}")
@@ -115,7 +131,7 @@ class GraphClient:
         user_id = self._resolve_user_id(user_id)
         url = f"{GRAPH_BASE}/users/{user_id}/onlineMeetings/{meeting_id}/recordings"
         resp = requests.get(url, headers=self.headers)
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json().get("value", [])
 
     def download_recording(self, meeting_id: str, recording_id: str, out_path: str, user_id: str = None):
@@ -131,7 +147,7 @@ class GraphClient:
         user_id = self._resolve_user_id(user_id)
         url = f"{GRAPH_BASE}/users/{user_id}/onlineMeetings/{meeting_id}/transcripts"
         resp = requests.get(url, headers=self.headers)
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json().get("value", [])
 
     def download_transcript(self, meeting_id: str, transcript_id: str, out_path: str, user_id: str = None):
@@ -140,13 +156,28 @@ class GraphClient:
             f"{GRAPH_BASE}/users/{user_id}/onlineMeetings/{meeting_id}"
             f"/transcripts/{transcript_id}/content"
         )
-        self._download(url, out_path, extra_headers={"Accept": "text/vtt"})
+        try:
+            self._download(url, out_path, extra_headers={"Accept": "text/vtt"})
+        except requests.HTTPError as e:
+            # Tenants can disable speaker-attributed transcript content, in
+            # which case text/vtt 403s with SpeakerAttributionNotAllowed and
+            # Graph expects a retry with the unattributed format instead.
+            # transcript_parser.py already tolerates the resulting lack of
+            # <v Speaker> tags, so no parsing changes are needed either way.
+            body = e.response.text if e.response is not None else ""
+            if e.response is not None and e.response.status_code == 403 and "SpeakerAttributionNotAllowed" in body:
+                self._download(
+                    url, out_path,
+                    extra_headers={"Accept": "application/vnd.microsoft.graph.transcript+text"},
+                )
+            else:
+                raise
 
     # Internal helper
     def _download(self, url: str, out_path: str, extra_headers: dict = None):
         headers = {**self.headers, **(extra_headers or {})}
         resp = requests.get(url, headers=headers, stream=True)
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         with open(out_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
