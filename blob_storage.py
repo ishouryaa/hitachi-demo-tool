@@ -70,11 +70,16 @@ def upload_pdf(pdf_bytes: bytes, subject: str = None, meeting_id: str = None) ->
     return blob_name
 
 
-def generate_download_url(blob_name: str) -> str:
+def generate_download_url(blob_name: str, download_filename: str = None) -> str:
     """Returns a time-limited, no-login-required URL the browser can hit
     directly to download the PDF. Sets content-disposition so it downloads
-    as a file instead of opening inline.
+    as a file instead of opening inline, named after the guide's own
+    AI-generated title (falls back to a generic name if none was produced).
     """
+    filename = _sanitize_filename(download_filename or "Hitachi_Navigation_Guide")
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
+
     client = _get_client()
     account_name = client.account_name
     account_key = client.credential.account_key
@@ -85,7 +90,7 @@ def generate_download_url(blob_name: str) -> str:
         account_key=account_key,
         permission=BlobSasPermissions(read=True),
         expiry=datetime.datetime.utcnow() + datetime.timedelta(minutes=DOWNLOAD_URL_TTL_MINUTES),
-        content_disposition='attachment; filename="demo_guide.pdf"',
+        content_disposition=f'attachment; filename="{filename}"',
     )
     return f"{client.url.rstrip('/')}/{CONTAINER_NAME}/{blob_name}?{sas_token}"
 

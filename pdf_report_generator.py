@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from fpdf import FPDF
 from google import genai
 from google.genai import types
+from PIL import Image
 
 from key_moments_extractor import extract_key_moments_from_vtt, generate_with_rate_limit
 from screenshot_extractor import extract_screenshots
@@ -51,19 +52,29 @@ based on a series of screenshots taken during a live product demo. Below are {co
 screenshots, each preceded by what the presenter said at that moment (for context).
 
 The spoken context may be in English, Hindi, or a mix of both. Understand it regardless of
-language, but your "title" and "bullets" output must ALWAYS be written in English.
+language, but all output must ALWAYS be written in English.
 
-Write ONE guide step per screenshot. Return ONLY a JSON array (no markdown fences, no
-commentary) with EXACTLY {count} elements, in the SAME ORDER as the screenshots. Element i
-corresponds to "Screenshot i". Each element must have exactly this shape:
+First, having now seen every screenshot and spoken segment in this demo, write ONE short
+overview title (3-8 words) naming the specific product/feature area this demo guide covers as a
+whole - e.g. "CRM Dashboard & Reporting Walkthrough", not a generic label like "Product Demo".
+
+Then write ONE guide step per screenshot, each with EXACTLY 2 bullet points - not fewer, not
+more. Each guide is printed two-screenshots-per-page, so space per step is limited: make every
+bullet a complete, information-dense sentence that combines related details rather than
+splitting them across more bullets.
+
+Return ONLY a JSON object (no markdown fences, no commentary) with EXACTLY this shape:
 {{
-    "title": "short feature/step name in English, e.g. 'Starting a Recording'",
-    "bullets": ["2 to 4 short bullet points in English describing what this feature does and/or how to navigate to it"]
+    "overview_title": "short overview title in English",
+    "steps": [
+        {{"title": "short feature/step name in English, e.g. 'Starting a Recording'", "bullets": ["bullet 1", "bullet 2"]}}
+    ]
 }}
 
-Base each step on both that screenshot and its spoken context. If a screenshot shows a specific
-UI element (button, menu, panel), name it and describe how to reach/use it. Keep bullets concise
-- one short sentence each. Return exactly {count} elements even if some screenshots look similar.
+"steps" must have EXACTLY {count} elements, in the SAME ORDER as the screenshots - element i
+corresponds to "Screenshot i". Base each step on both that screenshot and its spoken context. If
+a screenshot shows a specific UI element (button, menu, panel), name it and describe how to
+reach/use it. Return exactly {count} step elements even if some screenshots look similar.
 """
 
 
@@ -152,18 +163,21 @@ def _coerce_step(raw: dict) -> dict:
     return {"title": str(title), "bullets": [str(b) for b in bullets]}
 
 
-def write_steps_batch(items: list, api_key: str = None, use_cache: bool = True) -> list:
+def write_steps_batch(items: list, api_key: str = None, use_cache: bool = True) -> dict:
     """Ask Gemini to describe ALL screenshots in a single call.
 
-    items is a list of (image_path, spoken_text) tuples, in order. Returns a
-    list of {"title", "bullets"} dicts, one per item, in the same order.
+    items is a list of (image_path, spoken_text) tuples, in order. Returns
+    {"overview_title": str, "steps": [{"title", "bullets"}, ...]}, with steps
+    in the same order as items.
 
     This replaces the old one-call-per-screenshot loop: on the free tier, 14
     screenshots used to mean 14 rate-limited calls (~13s apart = minutes of
-    waiting) and burned the daily quota. Batching makes it a single request.
+    waiting) and burned the daily quota. Batching makes it a single request -
+    and since that one call already sees every screenshot, it also writes the
+    overview_title, instead of spending a separate Gemini call on that.
     """
     if not items:
-        return []
+        return {"overview_title": "", "steps": []}
 
     # Read all image bytes up front (also needed for the cache key).
     loaded = []
@@ -201,27 +215,93 @@ def write_steps_batch(items: list, api_key: str = None, use_cache: bool = True) 
     except json.JSONDecodeError as e:
         raise ValueError(f"Gemini did not return valid JSON for the batch. Raw response:\n{raw_text}") from e
 
-    if not isinstance(parsed, list):
-        raise ValueError(f"Expected a JSON array from Gemini, got: {type(parsed)}")
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Expected a JSON object from Gemini, got: {type(parsed)}")
+
+    overview_title = str(parsed.get("overview_title") or "").strip()
+    raw_steps = parsed.get("steps")
+    if not isinstance(raw_steps, list):
+        raise ValueError(f"Expected a 'steps' array from Gemini, got: {type(raw_steps)}")
 
     # Map results back by position. If Gemini returned the wrong count, fill any
     # gaps with a placeholder so every screenshot still gets a page.
     steps = []
     for i in range(len(loaded)):
-        raw = parsed[i] if i < len(parsed) and isinstance(parsed[i], dict) else {}
+        raw = raw_steps[i] if i < len(raw_steps) and isinstance(raw_steps[i], dict) else {}
         steps.append(_coerce_step(raw))
+
+    result = {"overview_title": overview_title, "steps": steps}
 
     os.makedirs(STEP_CACHE_DIR, exist_ok=True)
     with open(cache_file, "w", encoding="utf-8") as f:
-        json.dump(steps, f, indent=2)
+        json.dump(result, f, indent=2)
 
-    return steps
+    return result
 
 
-def build_pdf(steps: list, output_path: str = "demo_guide.pdf", title: str = "Product Demo Guide"):
-    """Lay out screenshot + title + bullets for each step into a Hitachi-branded PDF."""
+PAGE_MARGIN = 10
+CONTENT_WIDTH = 210 - 2 * PAGE_MARGIN
+BLOCK_TOP_MARGIN = 14
+BLOCK_HEIGHT = 132  # mm - two of these + a divider fit one A4 page
+BLOCK_GAP = 8
+MAX_RENDERED_BULLETS = 2
+
+
+def _fit_image_size(image_path: str, max_w: float, max_h: float) -> tuple:
+    """Returns (w, h) in mm that fit image_path within max_w x max_h, preserving aspect ratio."""
+    with Image.open(image_path) as im:
+        iw, ih = im.size
+    scale = min(max_w / iw, max_h / ih)
+    return iw * scale, ih * scale
+
+
+def _render_step_block(pdf: FPDF, step: dict, index: int, total: int, y_top: float) -> None:
+    """Renders one step (header, title, image, bullets) into a fixed-height
+    block starting at y_top, so exactly two blocks stack onto one A4 page."""
+    pdf.set_fill_color(*HITACHI_RED)
+    pdf.rect(0, y_top, 210, 10, style="F")
+    pdf.set_xy(PAGE_MARGIN, y_top + 1.5)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 7, f"Step {index} of {total}")
+
+    cursor_y = y_top + 13
+    pdf.set_xy(PAGE_MARGIN, cursor_y)
+    pdf.set_text_color(*HITACHI_DARK_GRAY)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.multi_cell(CONTENT_WIDTH, 6, step["title"])
+    cursor_y = pdf.get_y() + 1
+
+    if step.get("timestamp"):
+        pdf.set_xy(PAGE_MARGIN, cursor_y)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(0, 4, f"Timestamp: {step['timestamp']}")
+        cursor_y += 5
+
+    bullets = [b for b in step.get("bullets", []) if b][:MAX_RENDERED_BULLETS]
+    bullets_height = len(bullets) * 5.5 + 2
+
+    screenshot_path = step.get("screenshot_path")
+    if screenshot_path and os.path.exists(screenshot_path):
+        max_img_h = (y_top + BLOCK_HEIGHT) - cursor_y - bullets_height - 3
+        w, h = _fit_image_size(screenshot_path, CONTENT_WIDTH, max(max_img_h, 20))
+        x = PAGE_MARGIN + (CONTENT_WIDTH - w) / 2
+        pdf.image(screenshot_path, x=x, y=cursor_y + 2, w=w, h=h)
+        cursor_y = cursor_y + 2 + h + 3
+
+    pdf.set_text_color(*HITACHI_DARK_GRAY)
+    pdf.set_font("Helvetica", "", 10)
+    for bullet in bullets:
+        pdf.set_xy(PAGE_MARGIN + 4, cursor_y)
+        pdf.multi_cell(CONTENT_WIDTH - 4, 5.2, f"-  {bullet}")
+        cursor_y = pdf.get_y()
+
+
+def build_pdf(steps: list, output_path: str = "navigation_guide.pdf", subject_title: str = None):
+    """Lay out two screenshot+title+bullets steps per page into a Hitachi-branded PDF."""
     pdf = FPDF(orientation="P", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_auto_page_break(auto=False)
 
     # Cover page
     pdf.add_page()
@@ -234,47 +314,28 @@ def build_pdf(steps: list, output_path: str = "demo_guide.pdf", title: str = "Pr
     pdf.set_xy(0, 60)
     pdf.set_text_color(*HITACHI_DARK_GRAY)
     pdf.set_font("Helvetica", "B", 18)
-    pdf.multi_cell(0, 10, title, align="C")
+    pdf.multi_cell(0, 10, "Product Demo Guide", align="C")
+    if subject_title:
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.set_text_color(*HITACHI_RED)
+        pdf.ln(2)
+        pdf.multi_cell(0, 8, subject_title, align="C")
     pdf.set_font("Helvetica", "", 11)
     pdf.set_text_color(120, 120, 120)
     pdf.ln(4)
     pdf.multi_cell(0, 7, "Auto-generated navigation guide from the recorded demo call.", align="C")
 
-    for i, step in enumerate(steps, start=1):
+    for start in range(0, len(steps), 2):
+        pair = steps[start:start + 2]
         pdf.add_page()
+        _render_step_block(pdf, pair[0], start + 1, len(steps), BLOCK_TOP_MARGIN)
 
-        # Header bar with step number
-        pdf.set_fill_color(*HITACHI_RED)
-        pdf.rect(0, 0, 210, 16, style="F")
-        pdf.set_xy(10, 3)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 10, f"Step {i} of {len(steps)}", ln=1)
-
-        pdf.ln(14)
-        pdf.set_text_color(*HITACHI_DARK_GRAY)
-        pdf.set_font("Helvetica", "B", 16)
-        pdf.multi_cell(0, 9, step["title"])
-        pdf.ln(2)
-
-        if step.get("timestamp"):
-            pdf.set_font("Helvetica", "I", 9)
-            pdf.set_text_color(150, 150, 150)
-            pdf.cell(0, 6, f"Timestamp: {step['timestamp']}", ln=1)
-            pdf.ln(2)
-
-        screenshot_path = step.get("screenshot_path")
-        if screenshot_path and os.path.exists(screenshot_path):
-            page_width = pdf.w - 20  # 10mm margins each side
-            pdf.image(screenshot_path, x=10, w=page_width)
-            pdf.ln(6)
-
-        pdf.set_text_color(*HITACHI_DARK_GRAY)
-        pdf.set_font("Helvetica", "", 11)
-        for bullet in step.get("bullets", []):
-            pdf.set_x(14)
-            pdf.multi_cell(0, 7, f"-  {bullet}")
-        pdf.ln(2)
+        if len(pair) > 1:
+            divider_y = BLOCK_TOP_MARGIN + BLOCK_HEIGHT + BLOCK_GAP / 2
+            pdf.set_draw_color(220, 220, 220)
+            pdf.line(PAGE_MARGIN, divider_y, 210 - PAGE_MARGIN, divider_y)
+            second_y = BLOCK_TOP_MARGIN + BLOCK_HEIGHT + BLOCK_GAP
+            _render_step_block(pdf, pair[1], start + 2, len(steps), second_y)
 
     pdf.output(output_path)
     return output_path
@@ -283,11 +344,16 @@ def build_pdf(steps: list, output_path: str = "demo_guide.pdf", title: str = "Pr
 def generate_navigation_pdf(
     video_path: str,
     vtt_path: str,
-    output_pdf: str = "demo_guide.pdf",
+    output_pdf: str = "navigation_guide.pdf",
     screenshots_dir: str = "screenshots",
     use_cache: bool = True,
-) -> str:
-    """Full pipeline: transcript -> key moments -> screenshots -> Gemini step writeups -> PDF."""
+) -> dict:
+    """Full pipeline: transcript -> key moments -> screenshots -> Gemini step writeups -> PDF.
+
+    Returns {"path": output_pdf, "title": overview_title} - the title is
+    Gemini's short summary of what the demo covers, written onto the cover
+    page and available to callers for naming the downloaded file.
+    """
     print("Extracting key moments from transcript...")
     key_moments = extract_key_moments_from_vtt(vtt_path, use_cache=use_cache)
     print(f"Found {len(key_moments)} key moment(s).")
@@ -307,7 +373,9 @@ def generate_navigation_pdf(
     batch_items = [
         (m["screenshot_path"], _find_spoken_text(m["timestamp"], segments)) for m in captured
     ]
-    written = write_steps_batch(batch_items, use_cache=use_cache)
+    batch_result = write_steps_batch(batch_items, use_cache=use_cache)
+    overview_title = batch_result.get("overview_title") or ""
+    written = batch_result.get("steps", [])
 
     steps = []
     for moment, step in zip(captured, written):
@@ -316,10 +384,10 @@ def generate_navigation_pdf(
         steps.append(step)
         print(f"  [{moment['timestamp']}] {step['title']}")
 
-    print(f"Building PDF ({len(steps)} step(s))...")
-    output_path = build_pdf(steps, output_pdf)
+    print(f"Building PDF ({len(steps)} step(s)) - \"{overview_title or 'Product Demo Guide'}\"...")
+    output_path = build_pdf(steps, output_pdf, subject_title=overview_title)
     print(f"Saved: {output_path}")
-    return output_path
+    return {"path": output_path, "title": overview_title}
 
 
 if __name__ == "__main__":
@@ -330,7 +398,7 @@ if __name__ == "__main__":
     video_path = sys.argv[1]
     vtt_path = sys.argv[2]
     positional_rest = [a for a in sys.argv[3:] if not a.startswith("--")]
-    output_pdf = positional_rest[0] if positional_rest else "demo_guide.pdf"
+    output_pdf = positional_rest[0] if positional_rest else "navigation_guide.pdf"
     use_cache = "--no-cache" not in sys.argv[3:]
 
     if not os.path.exists(video_path):

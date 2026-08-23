@@ -262,10 +262,10 @@ def _run_job(job_id: str, join_url: str, organizer_email: str) -> None:
                 )
                 return
 
-            pdf_path = os.path.join(work_dir, "demo_guide.pdf")
+            pdf_path = os.path.join(work_dir, "navigation_guide.pdf")
             logging.info("Generating navigation PDF")
             try:
-                generate_navigation_pdf(
+                pdf_result = generate_navigation_pdf(
                     artifacts["recording_path"],
                     artifacts["transcript_path"],
                     output_pdf=pdf_path,
@@ -275,6 +275,7 @@ def _run_job(job_id: str, join_url: str, organizer_email: str) -> None:
                 logging.exception("Failed to generate PDF")
                 write_job_status(job_id, "error", error=f"Error generating PDF: {e}")
                 return
+            guide_title = pdf_result.get("title") or artifacts.get("subject") or ""
 
             with open(pdf_path, "rb") as f:
                 pdf_bytes = f.read()
@@ -288,7 +289,7 @@ def _run_job(job_id: str, join_url: str, organizer_email: str) -> None:
                 write_job_status(job_id, "error", error=f"Error saving PDF: {e}")
                 return
 
-        write_job_status(job_id, "done", blob_name=blob_name)
+        write_job_status(job_id, "done", blob_name=blob_name, guide_title=guide_title)
     except Exception as e:
         # Last-resort catch so a job never silently dies with status stuck.
         logging.exception("Unexpected error in background job")
@@ -319,7 +320,7 @@ def get_job_status(req: func.HttpRequest) -> func.HttpResponse:
         result["error"] = status.get("error", "Unknown error.")
     elif status["status"] == "done":
         try:
-            result["download_url"] = generate_download_url(status["blob_name"])
+            result["download_url"] = generate_download_url(status["blob_name"], download_filename=status.get("guide_title"))
         except Exception as e:
             logging.exception("Failed to generate download URL")
             result = {"status": "error", "error": f"Job finished but couldn't create a download link: {e}"}
